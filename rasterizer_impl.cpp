@@ -173,7 +173,6 @@ void Rasterizer::SetProjection()
     // equation 1: a3 - 1/n(a4) = -n
     // equation 2: a3 - 1/f(a4) = -f
     // solving with n = nearClip and f = farClip:
-
     // a4 = (nearClip - farClip) / (1.0/nearClip - 1.0/farClip) = -(nearClip)*(farClip);
     // a3 = -(nearClip) + 1.0/nearClip * a4 = -(nearClip + farClip);
 
@@ -193,7 +192,7 @@ void Rasterizer::SetProjection()
         1.0, 0.0, 0.0, 0.0,
         0.0, 1.0, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.0, 
-        width/2.0, (height/2.0), (nearClip + farClip)/2.0, 1.0
+        0, 0, (nearClip + farClip)/2.0, 1.0
     };
 
     glm::mat4 Mscale{ // then scale
@@ -223,8 +222,10 @@ void Rasterizer::SetScreenSpace()
         width/2.0, 0.0, 0.0, 0.0,
         0.0, height/2.0, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, 0.0, 1.0
+        width/2.0, height/2.0, 0.0, 1.0
     };
+
+
 
     this->screenspace = Mss;
 }
@@ -247,20 +248,15 @@ glm::vec3 Rasterizer::BarycentricCoordinate(glm::vec2 pos, Triangle trig)
     glm::vec2 B(trig.pos[1].x, trig.pos[1].y);
     glm::vec2 C(trig.pos[2].x, trig.pos[2].y);
 
-    //float alpha = (-(pos.x - B.x)*(C.y - B.y) + (pos.y - B.y)*(C.x - B.x))/(-(A.x - B.x)*(C.y - B.y)+(A.y - B.y)*(C.x - B.x));
-    //float beta = (-(pos.x - C.x)*(A.y - C.y) + (pos.y - C.y)*(A.x - C.x))/(-(B.x - C.x)*(A.y - C.y)+(B.y - C.y)*(A.x - C.x));
-    //float gamma = 1 - alpha - beta;
-
-    float area = crossZ(A, B, C);
-    float alpha = crossZ(pos, B, C) / area;
-    float beta = crossZ(pos, C, A) / area;
-    float gamma = crossZ(pos, A, B) / area;
+    float alpha = (-(pos.x - B.x)*(C.y - B.y) + (pos.y - B.y)*(C.x - B.x))/(-(A.x - B.x)*(C.y - B.y)+(A.y - B.y)*(C.x - B.x));
+    float beta = (-(pos.x - C.x)*(A.y - C.y) + (pos.y - C.y)*(A.x - C.x))/(-(B.x - C.x)*(A.y - C.y)+(B.y - C.y)*(A.x - C.x));
+    float gamma = 1 - alpha - beta;
 
     return glm::vec3{alpha, beta, gamma};
 }
 
-// initialize zBuffer to the largest possible value
-float Rasterizer::zBufferDefault = 1.0;
+// initialize zBuffer to the smallest possible value
+float Rasterizer::zBufferDefault = -1.0;
 
 /**
  * Update the depth information at a single pixel in the ZBuffer. This function will be called for every pixel in the bounding box of the triangle.
@@ -279,13 +275,12 @@ void Rasterizer::UpdateDepthAtPixel(uint32_t x, uint32_t y, Triangle original, T
     float depth = bc[0]*transformed.pos[0].z + bc[1]*transformed.pos[1].z + bc[2]*transformed.pos[2].z;
      
     // if depth is smaller than ZBuffer then updte ZBuffer
-    auto currentZBuffer = ZBuffer.Get(x,y);
-    if(currentZBuffer.has_value()) {
-        float ZB = currentZBuffer.value();
-        if(depth < ZB) {
-            ZBuffer.Set(x, y, depth);
+        float ZB = ZBuffer.Get(x,y).value();
+        if(depth > ZB) {
+            if(insideTriangle(glm::vec2{x, y}, glm::vec2(transformed.pos[0]), glm::vec2(transformed.pos[1]), glm::vec2(transformed.pos[2])))
+                ZBuffer.Set(x, y, depth);
         }
-    }
+    
 }
 
 /**
@@ -302,14 +297,11 @@ void Rasterizer::ShadeAtPixel(uint32_t x, uint32_t y, Triangle original, Triangl
     glm::vec3 bc = BarycentricCoordinate(glm::vec2{x, y},transformed);
     float depth = bc[0]*transformed.pos[0].z + bc[1]*transformed.pos[1].z + bc[2]*transformed.pos[2].z;
     
-    auto currentZBuffer = ZBuffer.Get(x,y);
-    if(currentZBuffer.has_value()) {
-        float ZB = currentZBuffer.value();
+        float ZB = ZBuffer.Get(x,y).value();
 
-        const float nearZero = 1e-5f;
-        if (std::abs(depth - ZB) < nearZero) { // if depth is exactly the value in ZBuffer
+        if (depth == ZB) { // if depth is exactly the value in ZBuffer
             // compute the position corresponding to the pixel in the world space
-            glm::vec3 pixel = bc[0] * glm::vec3(original.pos[0]) + bc[1] * glm::vec3(original.pos[1]) + bc[2] * glm::vec3(original.pos[2]);
+            glm::vec3 pixel = bc[0] * original.pos[0] + bc[1] * original.pos[1] + bc[2] * original.pos[2];
 
             // retrieve its normal using barycentric coordinates
             glm::vec3 normal = bc[0] * glm::vec3(original.normal[0]) + bc[1] * glm::vec3(original.normal[1]) + bc[2] * glm::vec3(original.normal[2]);
@@ -329,44 +321,35 @@ void Rasterizer::ShadeAtPixel(uint32_t x, uint32_t y, Triangle original, Triangl
             // iterate through all lights
             for(Light light : lights) {
                 // compute squared between object and light
-                float r2 = (light.pos.x - pixel.x)*(light.pos.x - pixel.x)
-                         + (light.pos.y - pixel.y)*(light.pos.y - pixel.y)
-                         + (light.pos.z - pixel.z)*(light.pos.z - pixel.z);
+                float r2 = glm::dot(light.pos - pixel, light.pos - pixel);
 
                 // compute light direction
-                glm::vec3 l = glm::normalize(light.pos - pixel);
+                glm::vec3 l = light.pos - pixel;
+                l = glm::normalize(l);
                 
                 // 2. add the diffuse (lambertian) component
                 float dot = glm::dot(l,normal);
                 if(dot > 0) {
-                    result.r += light.color.r * (light.intensity * 1.0 / r2 * dot);
-                    result.g += light.color.g * (light.intensity * 1.0 / r2 * dot);
-                    result.b += light.color.b * (light.intensity * 1.0 / r2 * dot);
+                    result = result + (light.intensity * dot/r2)*light.color;
                 }
                     
                 // compute direction from object to camera
                 glm::vec3 v = glm::normalize(camera.pos - pixel);
                 // compute h, the half vector of l and v
                 glm::vec3 h{
-                    (l.x + v.x) / 2.0,
-                    (l.y + v.y) / 2.0,
-                    (l.z + v.z) / 2.0
+                    (l.x + v.x),
+                    (l.y + v.y),
+                    (l.z + v.z)
                 };
-                //glm::vec3 h = glm::normalize(l + v);
+                h = glm::normalize(h);
 
                 // 3. add the specular component
                 dot = glm::dot(normal, h);
                 if(dot > 0) {
-                    result.r += light.color.r * (light.intensity * 1.0/r2 * std::pow(dot, exponent));
-                    result.g += light.color.g * (light.intensity * 1.0/r2 * std::pow(dot, exponent));
-                    result.b += light.color.b * (light.intensity * 1.0/r2 * std::pow(dot, exponent));
+                    result = result + (light.intensity * std::pow(dot, exponent)/r2) * light.color;
                 }
-            }
-
-            if(insideTriangle(glm::vec2{x, y}, glm::vec2(transformed.pos[0]), glm::vec2(transformed.pos[1]), glm::vec2(transformed.pos[2])))
-                image.Set(x, y, result);
-            
-        }
+             if(insideTriangle(glm::vec2{x, y}, glm::vec2(transformed.pos[0]), glm::vec2(transformed.pos[1]), glm::vec2(transformed.pos[2])))
+                 image.Set(x, y, result);
     }
     
 }
